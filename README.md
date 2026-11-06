@@ -68,7 +68,7 @@ Luego abrir:
 |---|---|---|
 | **Service** | `app/Services/ServerMetrics.php` | *Cómo* se obtienen los datos. Única clase que habla con el SO. |
 | **Controlador** | `app/Http/Controllers/ServerController.php` | *Qué* se responde y en *qué formato*: vista o JSON. |
-| **Vista** | `resources/views/servidor.blade.php` | *Cómo* se muestran los datos (tarjetas + polling). |
+| **Vista** | `resources/views/servidor.blade.php` | *Cómo* se muestran los datos: tarjetas, barras de uso y polling. |
 | **Rutas** | `routes/web.php`, `routes/api.php` | `/servidor` y `/api/metrics`. |
 
 El controlador recibe el service por **inyección de dependencias**: al declarar `index(ServerMetrics $metrics)`, Laravel lo crea y lo pasa automáticamente (service container). No se usa `new`.
@@ -136,6 +136,23 @@ Todas las capturas se tomaron contra el servidor corriendo en `http://127.0.0.1:
 ### Vista web `/servidor`
 
 ![Vista del monitor del servidor](docs/capturas/servidor.jpeg)
+
+### Estado del servidor — barras de uso
+
+Debajo de las tarjetas, cada métrica se representa con una barra que se colorea según el tramo de uso:
+
+![Sección Estado del servidor con barras de CPU, memoria, disco y temperatura](docs/capturas/estado-servidor.jpeg)
+
+| Barra | Origen | Rango |
+|---|---|---|
+| CPU | WMI `Win32_Processor` (`LoadPercentage`) | 0 – 100 % |
+| Memoria | WMI `Win32_OperatingSystem` | 0 – 100 % |
+| Disco | `disk_total_space()` / `disk_free_space()` | 0 – 100 % |
+| Temperatura | WMI `MSAcpi_ThermalZoneTemperature` | 0 – 100 °C |
+
+Colores según el valor: **verde** hasta 60 %, **ámbar** de 60 a 85 %, **rojo** por encima de 85 % y **gris** cuando no hay dato. La temperatura aparece en gris porque requiere iniciar el servidor como administrador (ver pregunta 1).
+
+Las barras se actualizan en el mismo `setInterval` de 5 segundos que usa el resto de la vista.
 
 ### Respuesta de `/api/metrics`
 
