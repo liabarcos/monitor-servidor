@@ -9,6 +9,8 @@ Aplicación Laravel que lee datos del sistema operativo Windows (WMI / PowerShel
 
 Ambas salidas consumen el mismo servicio `ServerMetrics`, que concentra toda la lógica de lectura del sistema operativo.
 
+Además incluye un **módulo de seguridad de accesos**: autenticación con registro de cada intento, detección de patrones sospechosos y bloqueo temporal por fuerza bruta, visible en el panel `/panel`.
+
 🔗 **Repositorio:** https://github.com/liabarcos/monitor-servidor
 
 ---
@@ -129,6 +131,8 @@ Invoke-RestMethod http://127.0.0.1:8000/api/metrics
 
 ## 📸 Capturas
 
+Todas las capturas se tomaron contra el servidor corriendo en `http://127.0.0.1:8000`.
+
 ### Vista web `/servidor`
 
 ![Vista del monitor del servidor](docs/capturas/servidor.jpeg)
@@ -136,6 +140,30 @@ Invoke-RestMethod http://127.0.0.1:8000/api/metrics
 ### Respuesta de `/api/metrics`
 
 ![Respuesta JSON de la API](docs/capturas/api-metrics.jpeg)
+
+### Acceso al panel `/panel`
+
+El panel está protegido: sin sesión redirige al login.
+
+![Formulario de inicio de sesión](docs/capturas/login.jpeg)
+
+### Intento de acceso fallido
+
+La app rechaza la contraseña y deja constancia del evento:
+
+![Mensaje de credenciales inválidas](docs/capturas/login-error.jpeg)
+
+### Panel de monitoreo — intentos exitosos y fallidos
+
+Contadores de las últimas 24 horas, IP con actividad sospechosa y el listado de eventos con el resultado de cada intento:
+
+![Panel con logins correctos y fallidos](docs/capturas/panel.jpeg)
+
+En la captura se puede ver:
+
+- **9 logins correctos** y **7 intentos fallidos** en las últimas 24 horas.
+- La IP `127.0.0.1` marcada por acumular **3 fallos en 5 minutos**.
+- Los eventos `success` (verde) y `failed` (amarillo) en el mismo listado.
 
 ---
 
@@ -146,6 +174,68 @@ La vista no se recarga: un `setInterval` llama a `/api/metrics` cada **5 segundo
 Verificado en la pestaña **Red (F12)**: dos pedidos a `/api/metrics` separados por 5002 ms, ambos HTTP 200, sin errores de consola.
 
 Con 5 s de intervalo, cada cliente genera **12 pedidos por minuto**.
+
+---
+
+## 🔐 Seguridad de accesos
+
+Módulo agregado al monitor: cada intento de autenticación queda registrado y el panel lo muestra en vivo.
+
+### Cómo funciona
+
+| Parte | Archivo | Responsabilidad |
+|---|---|---|
+| **Login** | `app/Http/Controllers/AuthController.php` | Muestra el formulario, valida credenciales y cierra sesión. |
+| **Panel** | `app/Http/Controllers/MonitoringController.php` | Consulta contadores, IP sospechosas y eventos de las últimas 24 h. |
+| **Registro** | `app/Listeners/RecordSecurityAuthentication.php` | Escucha los eventos `Login` y `Failed` y escribe en la tabla y en el log. |
+| **Guardia** | `app/Http/Middleware/SecurityLoginGuard.php` | Cuenta fallos por IP y bloquea antes de procesar el intento. |
+| **Modelo** | `app/Models/LoginAttempt.php` | Tabla `login_attempts`. |
+
+### Registro de eventos
+
+Al autenticarse se disparan los eventos `Illuminate\Auth\Events\Login` y `Failed`, que el listener `AppServiceProvider` deja suscritos. Cada evento escribe:
+
+- una fila en `login_attempts` con el **hash SHA-256** del identificador (nunca el correo en claro), la IP, el estado y el navegador;
+- una línea en el canal de log `security` (`storage/logs/security-*.log`) con nivel `info` si fue correcto y `warning` si falló.
+
+### Bloqueo por fuerza bruta
+
+La middleware `SecurityLoginGuard` se ejecuta **antes** de procesar el intento:
+
+| Fallos en 5 min (misma IP) | Acción |
+|---|---|
+| 1 – 2 | Se procesa el intento normalmente. |
+| 3 – 4 | Se registra un `alert` en el log de seguridad (patrón sospechoso). |
+| 5 o más | Se bloquea la IP durante **10 minutos** y responde **HTTP 429**. |
+
+Los intentos bloqueados también se guardan con estado `blocked`, por eso el panel muestra la tercera tarjeta "Rechazos por bloqueo".
+
+### Rutas
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/login` | Formulario de acceso. |
+| POST | `/login` | Intento de autenticación (con la guardia anti fuerza bruta). |
+| POST | `/logout` | Cierra la sesión. |
+| GET | `/panel` | Panel de monitoreo. Requiere sesión (`auth`). |
+
+### Verificación
+
+```powershell
+php artisan test
+```
+
+```text
+PASS  Tests\Feature\SecurityLoggingTest
+  ✓ login valido registra info y success
+  ✓ dos passwords incorrectas registran dos warning
+  ✓ tres fallos generan alert en el siguiente intento
+  ✓ cinco fallos bloquean la ip durante diez minutos
+  ✓ ip bloqueada responde 429 y registra blocked
+  ✓ panel requiere autenticacion
+
+Tests: 8 passed (25 assertions)
+```
 
 ---
 
@@ -242,8 +332,12 @@ y el servidor devolvería solo ese campo.
 
 - El script de PowerShell es **fijo**: nunca se construye con datos del usuario (evita inyección de comandos).
 - El endpoint tiene **rate limiting** (`throttle:60,1`).
+- **Autenticación** en `/panel`: sin sesión redirige a `/login`.
+- **Anti fuerza bruta:** 5 fallos en 5 minutos por IP → bloqueo de 10 minutos con respuesta HTTP 429.
+- **Sin datos personales en claro:** los intentos guardan un hash SHA-256 del identificador, nunca el correo.
+- **Log de seguridad aparte** (`storage/logs/security-*.log`), con retención de 30 días, separado del log general.
 - `.env`, `vendor` y la base SQLite **no se versionan** (están en `.gitignore`), así que las credenciales no se filtran al repositorio.
-- En producción correspondería autenticación (`auth:sanctum`) y HTTPS.
+- En producción correspondería HTTPS, y el endpoint del monitor podría protegerse con `auth:sanctum`.
 
 ---
 
@@ -251,13 +345,28 @@ y el servidor devolvería solo ese campo.
 
 ```text
 app/
-├── Http/Controllers/ServerController.php   # vista + API
-└── Services/ServerMetrics.php              # lectura del sistema operativo
-resources/views/servidor.blade.php          # tarjetas + polling
+├── Http/Controllers/
+│   ├── ServerController.php          # vista + API del monitor
+│   ├── AuthController.php            # login / logout
+│   └── MonitoringController.php      # panel de autenticaciones
+├── Http/Middleware/
+│   └── SecurityLoginGuard.php        # bloqueo por fuerza bruta
+├── Listeners/
+│   └── RecordSecurityAuthentication.php  # registra login/failed
+├── Models/
+│   └── LoginAttempt.php              # tabla login_attempts
+└── Services/
+    └── ServerMetrics.php             # lectura del sistema operativo
+resources/views/
+├── servidor.blade.php                # tarjetas + polling
+├── auth/login.blade.php              # formulario de acceso
+└── panel.blade.php                   # panel de monitoreo
 routes/
-├── web.php                                 # /servidor
-└── api.php                                 # /api/metrics
-docs/capturas/                              # capturas para la entrega
+├── web.php                           # /, /servidor, /login, /panel
+└── api.php                           # /api/metrics
+database/migrations/
+└── ..._create_login_attempts_table.php
+docs/capturas/                        # capturas para la entrega
 ```
 
 ---
